@@ -1,6 +1,6 @@
 pkgbase = neovide-nightly-bin
 	pkgdesc = No Nonsense Neovim Client in Rust (nightly build)
-	pkgver = nightly.r25.gade2d9c
+	pkgver = nightly.r24.g1111111
 	pkgrel = 1
 	url = https://github.com/neovide/neovide
 	arch = x86_64
