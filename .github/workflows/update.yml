@@ -1,13 +1,21 @@
-name: Test Neovide nightly update
+name: Update Neovide nightly
 
 on:
+  schedule:
+    - cron: '17 * * * *'
   workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish the detected update to AUR'
+        required: true
+        default: false
+        type: boolean
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  test:
+  update:
     runs-on: ubuntu-latest
 
     steps:
@@ -78,12 +86,12 @@ jobs:
             -E 's/^pkgrel=.*/pkgrel=1/' \
             PKGBUILD
 
-      - name: Build Arch packaging container
+      - name: Prepare Arch packaging environment
         if: steps.compare.outputs.needed == 'true'
         run: |
           docker pull archlinux:base-devel
 
-      - name: Update checksums
+      - name: Update checksums and .SRCINFO
         if: steps.compare.outputs.needed == 'true'
         run: |
           set -euo pipefail
@@ -93,32 +101,88 @@ jobs:
             -w /pkg \
             archlinux:base-devel \
             bash -euxo pipefail -c '
-              pacman -Syu --noconfirm --needed
-              updpkgsums
+              pacman-key --init
+              pacman-key --populate archlinux
+              pacman -Syu --noconfirm --needed pacman-contrib
+
+              uid="$(stat -c "%u" /pkg)"
+              gid="$(stat -c "%g" /pkg)"
+
+              groupadd --gid "$gid" builder
+              useradd --uid "$uid" --gid "$gid" --create-home builder
+
+              su builder -s /bin/bash -c "
+                cd /pkg
+                updpkgsums
+                makepkg --printsrcinfo > .SRCINFO
+              "
             '
 
-      - name: Regenerate .SRCINFO
+      - name: Show update
         if: steps.compare.outputs.needed == 'true'
         run: |
-          set -euo pipefail
-
-          docker run --rm \
-            -v "$PWD:/pkg" \
-            -w /pkg \
-            archlinux:base-devel \
-            bash -euxo pipefail -c '
-              makepkg --printsrcinfo > .SRCINFO
-            '
-
-      - name: Show simulated changes
-        if: steps.compare.outputs.needed == 'true'
-        run: |
-          echo '===== PKGBUILD diff ====='
+          echo '===== PKGBUILD ====='
           git diff -- PKGBUILD
 
-          echo '===== .SRCINFO diff ====='
+          echo '===== .SRCINFO ====='
           git diff -- .SRCINFO
 
-      - name: Confirm no AUR access
+      - name: Configure AUR SSH
+        if: steps.compare.outputs.needed == 'true' && (github.event_name == 'schedule' || inputs.publish)
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
         run: |
-          echo 'TEST MODE: AUR will not be accessed or modified.'
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur_key
+          chmod 600 ~/.ssh/aur_key
+
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+
+      - name: Clone AUR repository
+        if: steps.compare.outputs.needed == 'true' && (github.event_name == 'schedule' || inputs.publish)
+        run: |
+          set -euo pipefail
+
+          GIT_SSH_COMMAND='ssh -i ~/.ssh/aur_key -o IdentitiesOnly=yes' \
+            git clone \
+            ssh://aur@aur.archlinux.org/neovide-nightly-bin.git \
+            aur
+
+      - name: Publish to AUR
+        if: steps.compare.outputs.needed == 'true' && (github.event_name == 'schedule' || inputs.publish)
+        run: |
+          set -euo pipefail
+
+          cp PKGBUILD .SRCINFO aur/
+
+          cd aur
+
+          git config user.name 'AUR Sync Bot'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git add PKGBUILD .SRCINFO
+
+          git commit \
+            -m "Update to ${{ steps.nightly.outputs.pkgver }}"
+
+          GIT_SSH_COMMAND='ssh -i ~/.ssh/aur_key -o IdentitiesOnly=yes' \
+            git push origin master
+
+      - name: Commit GitHub repository
+        if: steps.compare.outputs.needed == 'true' && (github.event_name == 'schedule' || inputs.publish)
+        run: |
+          set -euo pipefail
+
+          git config user.name 'AUR Sync Bot'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git add PKGBUILD .SRCINFO
+
+          git commit \
+            -m "Update to ${{ steps.nightly.outputs.pkgver }}"
+
+          git push origin main
