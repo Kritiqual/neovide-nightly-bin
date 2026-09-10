@@ -1,0 +1,124 @@
+name: Test Neovide nightly update
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl
+
+      - name: Detect latest nightly
+        id: nightly
+        run: |
+          set -euo pipefail
+
+          tmpdir="$(mktemp -d)"
+          trap 'rm -rf "$tmpdir"' EXIT
+
+          curl -fL \
+            -o "$tmpdir/neovide-linux-x86_64.tar.gz" \
+            'https://github.com/neovide/neovide/releases/download/nightly/neovide-linux-x86_64.tar.gz'
+
+          tar -xzf "$tmpdir/neovide-linux-x86_64.tar.gz" -C "$tmpdir"
+
+          upstream_version="$("$tmpdir/neovide" --version)"
+
+          echo "Upstream version: $upstream_version"
+
+          pkgver="$(
+            sed -E \
+              's/^neovide (nightly)-([0-9]+)\+(g[0-9a-f]+)$/\1.r\2.\3/' \
+              <<< "$upstream_version"
+          )"
+
+          test -n "$pkgver"
+
+          echo "Latest pkgver: $pkgver"
+          echo "pkgver=$pkgver" >> "$GITHUB_OUTPUT"
+
+      - name: Compare versions
+        id: compare
+        run: |
+          set -euo pipefail
+
+          current="$(sed -n 's/^pkgver=//p' PKGBUILD)"
+          latest='${{ steps.nightly.outputs.pkgver }}'
+
+          echo "Current: $current"
+          echo "Latest:  $latest"
+
+          if [[ "$current" == "$latest" ]]; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update PKGBUILD
+        if: steps.compare.outputs.needed == 'true'
+        run: |
+          set -euo pipefail
+
+          sed -i \
+            -E 's/^pkgver=.*/pkgver=${{ steps.nightly.outputs.pkgver }}/' \
+            PKGBUILD
+
+          sed -i \
+            -E 's/^pkgrel=.*/pkgrel=1/' \
+            PKGBUILD
+
+      - name: Build Arch packaging container
+        if: steps.compare.outputs.needed == 'true'
+        run: |
+          docker pull archlinux:base-devel
+
+      - name: Update checksums
+        if: steps.compare.outputs.needed == 'true'
+        run: |
+          set -euo pipefail
+
+          docker run --rm \
+            -v "$PWD:/pkg" \
+            -w /pkg \
+            archlinux:base-devel \
+            bash -euxo pipefail -c '
+              pacman -Syu --noconfirm --needed
+              updpkgsums
+            '
+
+      - name: Regenerate .SRCINFO
+        if: steps.compare.outputs.needed == 'true'
+        run: |
+          set -euo pipefail
+
+          docker run --rm \
+            -v "$PWD:/pkg" \
+            -w /pkg \
+            archlinux:base-devel \
+            bash -euxo pipefail -c '
+              makepkg --printsrcinfo > .SRCINFO
+            '
+
+      - name: Show simulated changes
+        if: steps.compare.outputs.needed == 'true'
+        run: |
+          echo '===== PKGBUILD diff ====='
+          git diff -- PKGBUILD
+
+          echo '===== .SRCINFO diff ====='
+          git diff -- .SRCINFO
+
+      - name: Confirm no AUR access
+        run: |
+          echo 'TEST MODE: AUR will not be accessed or modified.'
